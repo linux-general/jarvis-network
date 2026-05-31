@@ -61,19 +61,6 @@ Phase 1 is focused on building the secure, automated backbone the platform depen
 
 ---
 
-## Roadmap
-
-**Phase 1 (0–6 months)** — Infrastructure Foundation  
-Mesh network, Kubernetes cluster, automated node provisioning, TLS-secured coordination layer.
-
-**Phase 2 (6–12 months)** — Value Demonstration  
-Deployable use cases for small businesses: localized voice assistants, automated document processing, one-click replication guides.
-
-**Phase 3 (12–24 months)** — Trust Validation  
-Third-party security audits, zero-trust architecture validation, expansion into regulated sectors (healthcare, finance, legal).
-
----
-
 ## Documentation
 
 - [Technical Overview](./TECHNICAL_OVERVIEW.md) — Architecture, current infrastructure state, hardware reference, and deployment roadmap.
