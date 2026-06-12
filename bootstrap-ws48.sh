@@ -1,26 +1,23 @@
 #!/usr/bin/env bash
 # =============================================================================
-# bootstrap-ws48.sh — bring a fresh Kubuntu box up as a Jarvis Network
-#                     brain node (full voice stack, native host install).
+# bootstrap-ws48.sh — bring a fresh Kubuntu box up as a Jarvis Network brain
+#                     node. Host installs the heavy runtime (NVIDIA, Docker,
+#                     vLLM, Ollama, Tailscale); the voice stack runs as four
+#                     containers via docker compose.
 #
 # Run on a fresh Kubuntu install as user `jd` with sudo privileges:
 #
 #   curl -fsSL https://raw.githubusercontent.com/linux-general/jarvis-network/main/bootstrap-ws48.sh | bash
 #
-# Or for repeatable re-runs after cloning the repo:
-#
-#   git clone https://github.com/linux-general/jarvis-network.git
-#   cd jarvis-network && bash bootstrap-ws48.sh
-#
 # The script is IDEMPOTENT — re-running it skips anything already installed.
 #
-# Prompts twice for secrets at startup:
-#   1. headscale authkey (hskey-auth-…) — joins the tailnet
-#   2. GitHub PAT (fine-grained, read access to llm-wiki + local-llm) —
-#      clones the two private repos
+# Prompts twice at startup:
+#   1. headscale authkey (hskey-auth-…)
+#   2. GitHub PAT (needs `repo` for llm-wiki/local-llm clones AND
+#                   `read:packages` for GHCR image pulls)
 #
-# Both can also be supplied via env vars HEADSCALE_AUTHKEY / GITHUB_PAT
-# to allow non-interactive runs.
+# Both can be supplied via env vars HEADSCALE_AUTHKEY / GITHUB_PAT for
+# non-interactive use.
 # =============================================================================
 
 set -euo pipefail
@@ -30,22 +27,22 @@ readonly TARGET_USER="jd"
 readonly TARGET_HOME="/home/${TARGET_USER}"
 readonly HEADSCALE_URL="https://headscale.jarvisnetwork.org"
 
-# Model + voice asset choices. Matches what's running on ws-47 as of 2026-06-12.
+# Host vLLM (model + endpoint shared with the containers via host.docker.internal)
 readonly VLLM_MODEL_REPO="cpatonn/Qwen3-30B-A3B-Instruct-2507-AWQ-4bit"
 readonly VLLM_SERVED_NAME="qwen3.6:latest"
 readonly VLLM_PORT="11436"
 readonly VLLM_MAX_MODEL_LEN="40960"
 readonly VLLM_GPU_MEM_UTIL="0.85"
 readonly VLLM_TP_SIZE="2"
-readonly WHISPER_MODEL="large-v3-turbo"
-readonly PIPER_VOICE="en_US-lessac-medium"
 
-# Repos to clone (private — need PAT)
+# Repos
+readonly JARVIS_NETWORK_REPO="https://github.com/linux-general/jarvis-network.git"
 readonly LLM_WIKI_REPO="linux-general/llm-wiki"
 readonly LOCAL_LLM_REPO="linux-general/local-llm"
-
-# Repo to clone for the Hermes agent framework (public, no auth needed)
 readonly HERMES_AGENT_REPO="https://github.com/NousResearch/hermes-agent.git"
+
+# Where the compose file lives, relative to the cloned jarvis-network repo
+readonly COMPOSE_FILE_REL="compose/ws48.yml"
 
 # ── Output helpers ──────────────────────────────────────────────────────────
 readonly C_RESET='\033[0m'
@@ -61,7 +58,7 @@ warn()  { printf "${C_WARN}!${C_RESET} %s\n" "$*"; }
 skip()  { printf "${C_INFO}·${C_RESET} skip: %s\n" "$*"; }
 die()   { printf "${C_ERR}✗ %s${C_RESET}\n" "$*" >&2; exit 1; }
 
-# ── Pre-flight sanity ───────────────────────────────────────────────────────
+# ── Pre-flight ──────────────────────────────────────────────────────────────
 preflight() {
     step "preflight"
 
@@ -69,11 +66,9 @@ preflight() {
     [[ "$(id -un)" == "${TARGET_USER}" ]] || die "expected user '${TARGET_USER}', running as '$(id -un)'"
     [[ -d "${TARGET_HOME}" ]] || die "no home dir at ${TARGET_HOME}"
 
-    # Sudo sanity — bootstrap needs it for apt + docker install + tailscale up
     sudo -n true 2>/dev/null || sudo -v || die "sudo authentication failed"
     log "sudo OK"
 
-    # Kubuntu / Ubuntu family
     if [[ -r /etc/os-release ]]; then
         # shellcheck disable=SC1091
         . /etc/os-release
@@ -83,7 +78,6 @@ preflight() {
         esac
     fi
 
-    # GPU presence
     if lspci 2>/dev/null | grep -qi 'nvidia'; then
         log "NVIDIA GPU detected: $(lspci | grep -i 'nvidia' | head -1 | cut -d: -f3-)"
     else
@@ -94,21 +88,18 @@ preflight() {
 # ── Prompt for secrets ──────────────────────────────────────────────────────
 prompt_secrets() {
     step "credentials"
-
     if [[ -z "${HEADSCALE_AUTHKEY:-}" ]]; then
         printf "Paste headscale authkey (hskey-auth-… — input hidden): "
-        read -rs HEADSCALE_AUTHKEY
-        echo
+        read -rs HEADSCALE_AUTHKEY; echo
     fi
     [[ -n "${HEADSCALE_AUTHKEY:-}" ]] || die "headscale authkey is required"
     log "headscale authkey captured (${#HEADSCALE_AUTHKEY} chars)"
 
     if [[ -z "${GITHUB_PAT:-}" ]]; then
-        printf "Paste GitHub PAT (read access to llm-wiki + local-llm — input hidden): "
-        read -rs GITHUB_PAT
-        echo
+        printf "Paste GitHub PAT (scopes: repo + read:packages — input hidden): "
+        read -rs GITHUB_PAT; echo
     fi
-    [[ -n "${GITHUB_PAT:-}" ]] || die "GitHub PAT is required (needed to clone the two private repos)"
+    [[ -n "${GITHUB_PAT:-}" ]] || die "GitHub PAT is required (clones private repos + pulls GHCR images)"
     log "GitHub PAT captured (${#GITHUB_PAT} chars)"
 }
 
@@ -116,14 +107,14 @@ prompt_secrets() {
 install_nvidia_driver() {
     step "1. NVIDIA driver"
     if command -v nvidia-smi >/dev/null && nvidia-smi >/dev/null 2>&1; then
-        skip "nvidia-smi already works ($(nvidia-smi --query-gpu=driver_version --format=csv,noheader | head -1))"
+        skip "nvidia-smi works ($(nvidia-smi --query-gpu=driver_version --format=csv,noheader | head -1))"
         return
     fi
     sudo apt-get update -y
     sudo apt-get install -y ubuntu-drivers-common
     sudo ubuntu-drivers install
-    warn "driver installed; a REBOOT is required before vLLM/STT/TTS can use the GPU. Re-run this script after reboot to continue."
-    log "rebooting in 10 seconds (Ctrl+C to abort)…"
+    warn "driver installed; REBOOT required, then re-run this script to continue."
+    log "rebooting in 10s (Ctrl+C to abort)…"
     sleep 10
     sudo reboot
 }
@@ -131,12 +122,13 @@ install_nvidia_driver() {
 # ── 2. Docker ───────────────────────────────────────────────────────────────
 install_docker() {
     step "2. Docker"
-    if command -v docker >/dev/null; then
-        skip "docker present: $(docker --version)"
+    if command -v docker >/dev/null && docker compose version >/dev/null 2>&1; then
+        skip "docker + compose v2 present: $(docker --version)"
     else
         curl -fsSL https://get.docker.com | sudo sh
         sudo usermod -aG docker "${TARGET_USER}"
-        log "docker installed; you may need to log out + back in for group membership"
+        warn "you may need to log out + back in for the docker group membership to take effect"
+        warn "this script will use 'sudo docker' for the rest of this run as a workaround"
     fi
 }
 
@@ -144,7 +136,7 @@ install_docker() {
 install_nvidia_container_toolkit() {
     step "3. NVIDIA Container Toolkit"
     if dpkg -s nvidia-container-toolkit >/dev/null 2>&1; then
-        skip "nvidia-container-toolkit already installed"
+        skip "nvidia-container-toolkit installed"
         return
     fi
     curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey \
@@ -156,179 +148,101 @@ install_nvidia_container_toolkit() {
     sudo apt-get install -y nvidia-container-toolkit
     sudo nvidia-ctk runtime configure --runtime=docker
     sudo systemctl restart docker
-    log "nvidia-container-toolkit installed + docker reconfigured"
+    log "nvidia-container-toolkit installed + docker reconfigured for GPU containers"
 }
 
 # ── 4. Tailscale + headscale join ───────────────────────────────────────────
 install_tailscale_and_join() {
-    step "4. Tailscale + join jarvis-headscale"
+    step "4. Tailscale + jarvis-headscale"
     if ! command -v tailscale >/dev/null; then
         curl -fsSL https://tailscale.com/install.sh | sudo sh
     else
-        skip "tailscale already installed: $(tailscale version | head -1)"
+        skip "tailscale installed: $(tailscale version | head -1)"
     fi
-    if tailscale status >/dev/null 2>&1 && tailscale status | grep -q "${HEADSCALE_URL#https://}\|jarvisnetwork"; then
+    if tailscale status >/dev/null 2>&1 && tailscale status | grep -q "jarvisnetwork\|100.64."; then
         skip "tailscale already up on a jarvis-* tailnet"
-        log "tailnet IP: $(tailscale ip -4 | head -1)"
     else
         sudo tailscale up \
             --login-server="${HEADSCALE_URL}" \
             --authkey="${HEADSCALE_AUTHKEY}" \
             --accept-routes \
             --accept-dns=true
-        log "joined jarvis-headscale tailnet; IP: $(tailscale ip -4 | head -1)"
     fi
+    log "tailnet IP: $(tailscale ip -4 2>/dev/null | head -1 || echo 'pending')"
 }
 
-# ── 5. Apt OS deps ──────────────────────────────────────────────────────────
+# ── 5. Host apt deps ────────────────────────────────────────────────────────
 install_apt_deps() {
-    step "5. apt OS dependencies"
+    step "5. apt OS dependencies (host-side)"
     sudo apt-get update -y
     sudo apt-get install -y \
-        git curl ca-certificates jq \
+        git curl ca-certificates jq openssl \
         build-essential python3-venv python3-pip python3-dev \
-        portaudio19-dev ffmpeg libasound-dev libsndfile1 \
-        pipewire pipewire-pulse pulseaudio-utils \
-        nginx-light
-    log "apt deps installed"
+        pipewire pipewire-pulse pulseaudio-utils
+    log "apt deps installed (audio is PipeWire/PulseAudio so the hermes container can use the host mic)"
 }
 
-# ── 6. Hermes agent (native install) ────────────────────────────────────────
-install_hermes_agent() {
-    step "6. Hermes agent (native, ~/.hermes)"
-    if [[ -d "${TARGET_HOME}/.hermes/hermes-agent" ]]; then
-        skip "~/.hermes/hermes-agent already exists"
-        return
-    fi
-    mkdir -p "${TARGET_HOME}/.hermes"
-    git clone "${HERMES_AGENT_REPO}" "${TARGET_HOME}/.hermes/hermes-agent"
-    # setup-hermes.sh creates the venv + skill bundle + default SOUL.md.
-    # This intentionally leaves SOUL/MEMORY/USER as defaults — the operator
-    # is starting with an EMPTY agent (no C-3PO, no Marie). Personas can
-    # be added later via `hermes profile create <name>`.
-    cd "${TARGET_HOME}/.hermes/hermes-agent"
-    bash setup-hermes.sh
-    log "Hermes agent installed; SOUL.md / MEMORY.md left as defaults"
-}
-
-# ── 7. Clone our private helper repos ───────────────────────────────────────
-clone_private_repos() {
-    step "7. clone llm-wiki + local-llm"
+# ── 6. Clone the orchestrating repos ────────────────────────────────────────
+clone_repos() {
+    step "6. clone jarvis-network + local-llm + llm-wiki"
     local clone_url_prefix="https://${GITHUB_PAT}@github.com"
 
-    if [[ -d "${TARGET_HOME}/llm-wiki/.git" ]]; then
-        skip "~/llm-wiki/ already cloned"
+    # jarvis-network (public, but cheaper to clone via PAT to avoid rate limits)
+    if [[ -d "${TARGET_HOME}/jarvis-network/.git" ]]; then
+        skip "~/jarvis-network/ already cloned"
     else
-        git clone "${clone_url_prefix}/${LLM_WIKI_REPO}.git" "${TARGET_HOME}/llm-wiki"
-        log "llm-wiki cloned to ~/llm-wiki/"
+        git clone "${JARVIS_NETWORK_REPO}" "${TARGET_HOME}/jarvis-network"
     fi
-
     if [[ -d "${TARGET_HOME}/local-llm/.git" ]]; then
         skip "~/local-llm/ already cloned"
     else
         git clone "${clone_url_prefix}/${LOCAL_LLM_REPO}.git" "${TARGET_HOME}/local-llm"
-        log "local-llm cloned to ~/local-llm/"
+    fi
+    if [[ -d "${TARGET_HOME}/llm-wiki/.git" ]]; then
+        skip "~/llm-wiki/ already cloned"
+    else
+        git clone "${clone_url_prefix}/${LLM_WIKI_REPO}.git" "${TARGET_HOME}/llm-wiki"
     fi
 
-    # Strip the PAT from the git remotes so it doesn't sit on disk
-    git -C "${TARGET_HOME}/llm-wiki"  remote set-url origin "https://github.com/${LLM_WIKI_REPO}.git"
+    # Strip the PAT from the git remotes (it's still in shell history but not on disk)
     git -C "${TARGET_HOME}/local-llm" remote set-url origin "https://github.com/${LOCAL_LLM_REPO}.git"
-    log "PAT removed from remote URLs"
+    git -C "${TARGET_HOME}/llm-wiki"  remote set-url origin "https://github.com/${LLM_WIKI_REPO}.git"
+    log "repos cloned; PAT removed from remote URLs"
 }
 
-# ── 8. Voice-stack venv (Kokoro + faster-whisper + Wyoming + WebRTC) ────────
-setup_local_llm_venv() {
-    step "8. ~/local-llm/.venv (voice deps)"
-    local venv="${TARGET_HOME}/local-llm/.venv"
-    if [[ -d "${venv}" ]]; then
-        skip "local-llm venv already exists"
-    else
-        python3 -m venv "${venv}"
-    fi
-    # shellcheck disable=SC1091
-    source "${venv}/bin/activate"
-    pip install -q --upgrade pip wheel setuptools
-    pip install -q \
-        faster-whisper piper-tts \
-        sounddevice soundfile pyaudio pydub \
-        wyoming aiohttp scipy
-    deactivate
-    log "voice deps installed in ~/local-llm/.venv"
-}
-
-# ── 9. Pre-pull Whisper + Piper voice assets ────────────────────────────────
-prepull_voice_models() {
-    step "9. pre-pull Whisper + Piper voices"
-    mkdir -p "${TARGET_HOME}/.cache/whisper/models"
-    mkdir -p "${TARGET_HOME}/local-llm/piper-voices"
-    # shellcheck disable=SC1091
-    source "${TARGET_HOME}/local-llm/.venv/bin/activate"
-    # Whisper: faster-whisper downloads on first instantiation
-    python3 - <<PY
-from faster_whisper import WhisperModel
-import os
-WhisperModel("${WHISPER_MODEL}", device="cuda", compute_type="int8_float16",
-             download_root=os.path.expanduser("~/.cache/whisper/models"))
-print("whisper model ready")
-PY
-    # Piper: voice JSON + ONNX
-    python3 -m piper.download_voices "${PIPER_VOICE}" \
-        --data-dir "${TARGET_HOME}/local-llm/piper-voices/" || \
-        warn "piper voice prefetch failed; will fetch on first use"
-    deactivate
-    log "Whisper + Piper voice assets ready"
-}
-
-# ── 10. vLLM venv + Qwen model pre-pull ─────────────────────────────────────
-setup_vllm() {
-    step "10. vLLM (~/jarvis-vllm/.venv) + Qwen3-30B-A3B AWQ"
+# ── 7. vLLM on host (systemd-user) + model pre-pull ─────────────────────────
+setup_vllm_host() {
+    step "7. vLLM (~/jarvis-vllm/.venv) + Qwen3-30B-A3B AWQ"
     local venv="${TARGET_HOME}/jarvis-vllm/.venv"
-    if [[ -d "${venv}" ]]; then
-        skip "vLLM venv already exists"
-    else
+    if [[ ! -d "${venv}" ]]; then
         mkdir -p "${TARGET_HOME}/jarvis-vllm"
         python3 -m venv "${venv}"
         # shellcheck disable=SC1091
         source "${venv}/bin/activate"
         pip install -q --upgrade pip wheel setuptools
-        pip install -q "vllm==0.22.0" "transformers==5.10.2" "flashinfer-python"
+        pip install -q "vllm==0.22.0" "transformers==5.10.2" "huggingface_hub" "flashinfer-python"
         deactivate
+        log "vLLM venv created"
+    else
+        skip "vLLM venv exists"
     fi
 
-    # Pre-pull the model with hf_hub (avoids the cold-start hit later)
+    # Pre-pull the model (one-time ~17GB download)
     # shellcheck disable=SC1091
     source "${venv}/bin/activate"
     python3 - <<PY
 from huggingface_hub import snapshot_download
-snapshot_download(repo_id="${VLLM_MODEL_REPO}", local_dir=None)
+snapshot_download(repo_id="${VLLM_MODEL_REPO}")
 print("vLLM model ready")
 PY
     deactivate
-    log "vLLM ready, Qwen3-30B-A3B AWQ pre-pulled"
-}
 
-# ── 11. Ollama (backup only, no models) ─────────────────────────────────────
-install_ollama() {
-    step "11. Ollama (backup; no models pulled)"
-    if command -v ollama >/dev/null; then
-        skip "ollama already installed: $(ollama --version 2>&1 | head -1)"
-        return
-    fi
-    curl -fsSL https://ollama.com/install.sh | sh
-    log "ollama installed (no models pulled)"
-}
-
-# ── 12. systemd-user units (mirror ws-47) ───────────────────────────────────
-write_systemd_units() {
-    step "12. systemd-user units"
+    # systemd-user unit
     local unit_dir="${TARGET_HOME}/.config/systemd/user"
     mkdir -p "${unit_dir}"
-
-    # vLLM TP=2 -- ws-47 uses GPUs 1+3 there; ws-48 only has 2 GPUs so they
-    # default to all-of-them and CUDA_DEVICE_ORDER=PCI_BUS_ID picks them.
     cat > "${unit_dir}/vllm-tp2.service" <<EOF
 [Unit]
-Description=vLLM TP=${VLLM_TP_SIZE} server (port ${VLLM_PORT}, ${VLLM_MODEL_REPO})
+Description=vLLM TP=${VLLM_TP_SIZE} (port ${VLLM_PORT}, ${VLLM_MODEL_REPO})
 After=network-online.target
 Wants=network-online.target
 
@@ -353,76 +267,30 @@ StandardError=journal
 WantedBy=default.target
 EOF
 
-    # Wyoming STT (faster-whisper)
-    cat > "${unit_dir}/wyoming-stt.service" <<EOF
-[Unit]
-Description=Wyoming STT (faster-whisper ${WHISPER_MODEL}, port 10300)
-After=network-online.target
-
-[Service]
-Type=simple
-ExecStart=${TARGET_HOME}/local-llm/.venv/bin/python ${TARGET_HOME}/local-llm/wyoming/stt_server.py
-Restart=always
-RestartSec=5
-Environment=HOME=${TARGET_HOME}
-Environment=PYTHONPATH=${TARGET_HOME}/.hermes/hermes-agent
-StandardOutput=journal
-StandardError=journal
-
-[Install]
-WantedBy=default.target
-EOF
-
-    # Wyoming TTS (Kokoro -> Piper fallback)
-    cat > "${unit_dir}/wyoming-tts.service" <<EOF
-[Unit]
-Description=Wyoming TTS (Kokoro -> Piper fallback, port 10200)
-After=network-online.target
-
-[Service]
-Type=simple
-ExecStart=${TARGET_HOME}/local-llm/.venv/bin/python ${TARGET_HOME}/local-llm/wyoming/tts_server.py
-Restart=always
-RestartSec=5
-Environment=HOME=${TARGET_HOME}
-StandardOutput=journal
-StandardError=journal
-
-[Install]
-WantedBy=default.target
-EOF
-
-    # Wyoming WebRTC gateway
-    cat > "${unit_dir}/wyoming-webrtc.service" <<EOF
-[Unit]
-Description=Hermes WebRTC voice gateway (HTTPS port 8443)
-After=network-online.target wyoming-stt.service wyoming-tts.service
-Wants=wyoming-stt.service wyoming-tts.service
-
-[Service]
-Type=simple
-ExecStart=${TARGET_HOME}/.hermes/hermes-agent/venv/bin/python ${TARGET_HOME}/local-llm/webrtc/ws_gateway.py
-Restart=always
-RestartSec=5
-Environment=HOME=${TARGET_HOME}
-Environment=PYTHONPATH=${TARGET_HOME}/.hermes/hermes-agent
-StandardOutput=journal
-StandardError=journal
-
-[Install]
-WantedBy=default.target
-EOF
-
-    log "systemd-user units written to ~/.config/systemd/user/"
+    sudo loginctl enable-linger "${TARGET_USER}"
+    systemctl --user daemon-reload
+    systemctl --user enable --now vllm-tp2.service
+    log "vLLM systemd-user unit enabled + started (warm-up ~80-100s on cold cache)"
 }
 
-# ── 13. self-signed TLS cert for the WebRTC gateway ─────────────────────────
+# ── 8. Ollama (backup only, no models) ──────────────────────────────────────
+install_ollama() {
+    step "8. Ollama (backup only)"
+    if command -v ollama >/dev/null; then
+        skip "ollama installed: $(ollama --version 2>&1 | head -1)"
+        return
+    fi
+    curl -fsSL https://ollama.com/install.sh | sh
+    log "ollama installed (no models pulled)"
+}
+
+# ── 9. Generate self-signed cert for the WebRTC gateway ─────────────────────
 make_webrtc_certs() {
-    step "13. self-signed cert for WebRTC gateway"
+    step "9. self-signed cert for the WebRTC gateway"
     local cert_dir="${TARGET_HOME}/local-llm/webrtc/certs"
     mkdir -p "${cert_dir}"
-    if [[ -f "${cert_dir}/ws-48.crt" ]]; then
-        skip "ws-48 cert already exists"
+    if [[ -f "${cert_dir}/ws-48.crt" && -f "${cert_dir}/ws-48.key" ]]; then
+        skip "ws-48 cert + key already exist"
         return
     fi
     openssl req -x509 -nodes -newkey rsa:2048 -days 825 \
@@ -431,76 +299,101 @@ make_webrtc_certs() {
         -out    "${cert_dir}/ws-48.crt" \
         2>/dev/null
     chmod 600 "${cert_dir}/ws-48.key"
-    log "self-signed cert + key generated for ws-48"
+    log "self-signed cert + key generated (mounted read-only into the webrtc container)"
 }
 
-# ── 14. Enable user lingering + start services ──────────────────────────────
-start_services() {
-    step "14. enable lingering + start services"
-    sudo loginctl enable-linger "${TARGET_USER}"
-    log "user lingering enabled (services survive logout)"
+# ── 10. Log in to GHCR + pull the four images ───────────────────────────────
+docker_login_and_pull() {
+    step "10. docker login GHCR + pull container images"
+    echo "${GITHUB_PAT}" | sudo docker login ghcr.io -u "$(git config --global user.name 2>/dev/null || echo linux-general)" --password-stdin 2>&1 | tail -1
+    log "GHCR login OK"
+    cd "${TARGET_HOME}/jarvis-network"
+    sudo docker compose -f "${COMPOSE_FILE_REL}" pull
+    log "all images pulled"
+}
 
-    systemctl --user daemon-reload
-    for svc in vllm-tp2 wyoming-stt wyoming-tts wyoming-webrtc; do
-        systemctl --user enable --now "${svc}.service" || warn "${svc} failed to start; check journalctl --user -u ${svc}"
+# ── 11. Bring up the stack ──────────────────────────────────────────────────
+compose_up() {
+    step "11. docker compose up -d"
+    cd "${TARGET_HOME}/jarvis-network"
+    sudo docker compose -f "${COMPOSE_FILE_REL}" up -d
+    log "containers started"
+    sleep 4
+    sudo docker compose -f "${COMPOSE_FILE_REL}" ps
+}
+
+# ── 12. Configure Hermes CLI inside the container ───────────────────────────
+configure_hermes_cli() {
+    step "12. configure Hermes CLI inside the hermes container"
+    # Wait for hermes container to be up
+    for _ in 1 2 3 4 5; do
+        if sudo docker exec hermes true 2>/dev/null; then break; fi
+        sleep 2
     done
+    # Point Hermes CLI at host vLLM and at the container-network STT/TTS hosts.
+    # These are the canonical config keys per ~/.hermes/config.yaml on ws-47.
+    sudo docker exec -u hermes hermes bash -lc "
+        hermes config set model.base_url http://host.docker.internal:11436/v1 || true
+        hermes config set model.default qwen3.6:latest || true
+        hermes config set tts.provider wyoming || true
+        hermes config set stt.provider wyoming || true
+        hermes config set voice.record_key ctrl+b || true
+    " 2>&1 | tail -6 || warn "couldn't fully configure Hermes CLI in container — try again with 'docker exec -it hermes hermes'"
+    log "Hermes CLI configured (model.base_url, providers, ctrl+b record key)"
 }
 
-# ── 15. Health summary ──────────────────────────────────────────────────────
+# ── 13. Summary + health probes ─────────────────────────────────────────────
 print_summary() {
-    step "15. summary"
+    step "13. summary"
     local ts_ip
     ts_ip="$(tailscale ip -4 2>/dev/null | head -1 || echo 'unknown')"
 
     printf "\n${C_BOLD}=== ws-48 bootstrap complete ===${C_RESET}\n\n"
     printf "  Tailscale IP            : %s\n" "${ts_ip}"
-    printf "  vLLM endpoint           : http://127.0.0.1:%s/v1   (also reachable at http://%s:%s/v1)\n" "${VLLM_PORT}" "${ts_ip}" "${VLLM_PORT}"
-    printf "  Wyoming STT             : 127.0.0.1:10300\n"
-    printf "  Wyoming TTS             : 127.0.0.1:10200\n"
-    printf "  WebRTC voice gateway    : https://127.0.0.1:8443\n"
-    printf "  Hermes home             : %s/.hermes/    (empty agent — no persona)\n" "${TARGET_HOME}"
+    printf "  Host vLLM endpoint      : http://127.0.0.1:%s/v1\n" "${VLLM_PORT}"
+    printf "  Containers              : stt, tts, hermes, webrtc (docker compose ps)\n"
+    printf "  STT (Wyoming)           : 127.0.0.1:10300  (also reachable as stt:10300 inside voice-net)\n"
+    printf "  TTS (Wyoming)           : 127.0.0.1:10200  (also reachable as tts:10200 inside voice-net)\n"
+    printf "  WebRTC gateway          : https://%s:8443  (self-signed cert — accept the browser warning)\n" "${ts_ip}"
     printf "  llm-wiki                : %s/llm-wiki/\n" "${TARGET_HOME}"
-    printf "  Voice trigger (CLI)     : Ctrl+B (see ~/.hermes/config.yaml, voice.record_key)\n"
-    printf "\n  Phone routing           : 770-451-5224 is currently still pointed at ws-47.\n"
-    printf "                            ws-48 won't see phone traffic until nginx is\n"
-    printf "                            updated to route it here via Tailscale.\n\n"
-    printf "  Next steps:\n"
-    printf "    • hermes              # open the Hermes CLI; default empty SOUL.\n"
-    printf "    • cat %s/llm-wiki/AGENTS.md   # read the wiki contract.\n" "${TARGET_HOME}"
-    printf "    • journalctl --user -u vllm-tp2 -f   # tail vLLM logs.\n\n"
+    printf "\n  Open the Hermes CLI:\n"
+    printf "    docker exec -it hermes hermes\n"
+    printf "  Voice trigger inside the CLI: Ctrl+B (see ~/.hermes/config.yaml)\n\n"
+    printf "  Phone routing           : 770-451-5224 still hits ws-47. ws-48 won't get phone\n"
+    printf "                            traffic until the nginx side is updated to route the\n"
+    printf "                            number to ws-48 over the tailnet.\n\n"
 
     # Quick health checks
-    sleep 2
     if curl -fsS -m 2 "http://127.0.0.1:${VLLM_PORT}/health" >/dev/null 2>&1; then
-        log "vLLM health: OK"
+        log "vLLM /health: OK"
     else
-        warn "vLLM not responding yet (cold start ~80-100s); tail journalctl --user -u vllm-tp2"
+        warn "vLLM not yet responding (cold start ~80-100s); tail journalctl --user -u vllm-tp2"
     fi
-    if curl -fsS -m 2 "http://127.0.0.1:10300" >/dev/null 2>&1; then
-        log "Wyoming STT: reachable"
-    else
-        warn "Wyoming STT not yet listening"
-    fi
+    for svc in stt tts hermes webrtc; do
+        if sudo docker ps --format '{{.Names}}' | grep -q "^${svc}$"; then
+            log "container ${svc}: running"
+        else
+            warn "container ${svc}: NOT running — check 'sudo docker compose -f ${TARGET_HOME}/jarvis-network/${COMPOSE_FILE_REL} logs ${svc}'"
+        fi
+    done
 }
 
 # ── main ───────────────────────────────────────────────────────────────────
 main() {
     preflight
     prompt_secrets
-    install_nvidia_driver           # may reboot
+    install_nvidia_driver               # may reboot
     install_docker
     install_nvidia_container_toolkit
     install_tailscale_and_join
     install_apt_deps
-    install_hermes_agent
-    clone_private_repos
-    setup_local_llm_venv
-    prepull_voice_models
-    setup_vllm
+    clone_repos
+    setup_vllm_host
     install_ollama
-    write_systemd_units
     make_webrtc_certs
-    start_services
+    docker_login_and_pull
+    compose_up
+    configure_hermes_cli
     print_summary
 }
 

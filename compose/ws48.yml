@@ -1,0 +1,189 @@
+# =============================================================================
+# compose/ws48.yml — full-stack brain node, host vLLM + 4 containers
+#
+# Target: ws-48 (any fresh Linux brain node mirroring ws-47's voice stack).
+# Pulled by jarvis-network/bootstrap-ws48.sh after host prereqs are installed.
+#
+# Architecture:
+#
+#   HOST                                Docker network: voice-net
+#   ────                                ──────────────────────────
+#   vLLM (systemd-user, :11436)  ◄──    hermes ──► stt
+#   Ollama (backup, :11434)             │  │       (faster-whisper, :10300)
+#                                       │  │
+#                                       │  ├──► tts
+#                                       │  │    (Kokoro→Piper, :10200)
+#                                       │  │
+#                                       └──┴──► webrtc
+#                                               (browser mic, :8443)
+#
+# All four containers reach the host vLLM via host.docker.internal:11436
+# (the extra_hosts entry below maps that to the host gateway IP).
+#
+# Container ↔ container traffic goes over the voice-net bridge by service
+# name (hermes hits "stt:10300", "tts:10200", "webrtc:8443").
+#
+# Images:
+#   ghcr.io/linux-general/hermes-voice       used by `hermes` and `webrtc`
+#                                            (entrypoints overridden below)
+#   ghcr.io/linux-general/hermes-voice-stt   used by `stt`
+#   ghcr.io/linux-general/hermes-voice-tts   used by `tts`
+# =============================================================================
+
+networks:
+  voice-net:
+    driver: bridge
+    name: voice-net
+
+volumes:
+  hermes_home:        # persisted /home/hermes/.hermes for the hermes container
+  hermes_workspace:   # scratch space for the hermes user
+  hf_cache:           # HuggingFace caches shared between stt + tts
+
+services:
+
+  # ── STT — faster-whisper, CPU-only (host GPUs are vLLM's) ────────────────
+  stt:
+    image: ghcr.io/linux-general/hermes-voice-stt:latest
+    container_name: stt
+    restart: unless-stopped
+    networks:
+      voice-net:
+        aliases: [stt]
+    ports:
+      - "127.0.0.1:10300:10300"   # exposed so Hermes CLI on host can reach
+    environment:
+      WYOMING_STT_HOST: "0.0.0.0"
+      WYOMING_STT_PORT: "10300"
+      WYOMING_STT_MODEL: "large-v3-turbo"
+      WYOMING_STT_DEVICE: "cpu"
+      WYOMING_STT_COMPUTE_TYPE: "int8"
+    volumes:
+      - hf_cache:/root/.cache/huggingface
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; s=socket.socket(); s.settimeout(3); s.connect(('127.0.0.1',10300)); s.close()"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 120s
+
+  # ── TTS — Kokoro primary, Piper fallback, CPU ────────────────────────────
+  tts:
+    image: ghcr.io/linux-general/hermes-voice-tts:latest
+    container_name: tts
+    restart: unless-stopped
+    networks:
+      voice-net:
+        aliases: [tts]
+    ports:
+      - "127.0.0.1:10200:10200"
+    environment:
+      WYOMING_TTS_HOST: "0.0.0.0"
+      WYOMING_TTS_PORT: "10200"
+      WYOMING_TTS_VOICE: "bm_george"
+    volumes:
+      - hf_cache:/root/.cache/huggingface
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; s=socket.socket(); s.settimeout(3); s.connect(('127.0.0.1',10200)); s.close()"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+
+  # ── Hermes — agent framework + CLI for interactive use ───────────────────
+  # Same image as `webrtc` and as the c3po-ready orchestrator, but entrypoint
+  # is overridden to "sleep infinity" — ws-48 doesn't handle phone traffic in
+  # v0, so we don't start media_server.py. Operator drops into the container
+  # for CLI work:
+  #
+  #   docker exec -it hermes hermes               # the CLI
+  #   docker exec -it hermes bash                 # general shell
+  hermes:
+    image: ghcr.io/linux-general/hermes-voice:latest
+    container_name: hermes
+    restart: unless-stopped
+    networks:
+      voice-net:
+        aliases: [hermes]
+    depends_on:
+      stt:
+        condition: service_started
+      tts:
+        condition: service_started
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      # Host vLLM endpoint
+      LLM_BASE_URL: "http://host.docker.internal:11436/v1"
+      LLM_MODEL: "qwen3.6:latest"
+      LLM_API_KEY: "sk-local-vllm-no-auth-required"
+      # Container-network Wyoming hosts (resolved by docker DNS)
+      WYOMING_STT_HOST: "stt"
+      WYOMING_STT_PORT: "10300"
+      WYOMING_TTS_HOST: "tts"
+      WYOMING_TTS_PORT: "10200"
+      TTS_VOICE: "bm_george"
+      # PulseAudio bridge — uses the host operator's socket so Ctrl+B voice
+      # mode in the CLI reaches the operator's mic + speaker
+      PULSE_SERVER: "unix:/run/pulse/native"
+    volumes:
+      - hermes_home:/home/hermes/.hermes
+      - hermes_workspace:/home/hermes/workspace
+      # Host PulseAudio socket (UID 1000 on both ends — the image's hermes
+      # user is uid 1000 and the host's jd user is also uid 1000)
+      - /run/user/1000/pulse:/run/pulse:ro
+    devices:
+      - /dev/snd
+    # Override the orchestrator entrypoint — ws-48 doesn't run media_server.py
+    entrypoint: ["tini", "--"]
+    command: ["sleep", "infinity"]
+    stdin_open: true
+    tty: true
+
+  # ── WebRTC voice gateway — browser mic / speaker over HTTPS ──────────────
+  # Reuses the hermes-voice image (same Python + Hermes + aiohttp + numpy
+  # that ws_gateway.py needs) but runs ws_gateway.py instead of the
+  # Twilio media server. The script lives in the local-llm repo, cloned
+  # to ~/local-llm/ on the host and bind-mounted in here.
+  webrtc:
+    image: ghcr.io/linux-general/hermes-voice:latest
+    container_name: webrtc
+    restart: unless-stopped
+    networks:
+      voice-net:
+        aliases: [webrtc]
+    depends_on:
+      stt:
+        condition: service_started
+      tts:
+        condition: service_started
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      WS_GATEWAY_HOST: "0.0.0.0"
+      WS_GATEWAY_PORT: "8443"
+      WS_TLS_CERT: "/app/webrtc/certs/ws-48.crt"
+      WS_TLS_KEY:  "/app/webrtc/certs/ws-48.key"
+      WYOMING_STT_HOST: "stt"
+      WYOMING_STT_PORT: "10300"
+      WYOMING_TTS_HOST: "tts"
+      WYOMING_TTS_PORT: "10200"
+      LLM_BASE_URL: "http://host.docker.internal:11436/v1"
+      LLM_MODEL: "qwen3.6:latest"
+      LLM_API_KEY: "sk-local-vllm-no-auth-required"
+      TTS_VOICE: "bm_george"
+    volumes:
+      # Bind-mount the WebRTC gateway code from the host clone of local-llm.
+      # Read-only so accidental writes inside the container don't corrupt
+      # the operator's source tree.
+      - ${HOME}/local-llm/webrtc:/app/webrtc:ro
+    ports:
+      - "8443:8443"
+    entrypoint: ["tini", "--"]
+    command: ["python", "/app/webrtc/ws_gateway.py"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket,ssl; ctx=ssl._create_unverified_context(); s=socket.create_connection(('127.0.0.1',8443),timeout=3); ssl_s=ctx.wrap_socket(s,server_hostname='127.0.0.1'); ssl_s.close()"]
+      interval: 60s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
