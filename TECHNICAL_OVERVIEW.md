@@ -88,7 +88,7 @@ The reference node configuration used in current development:
 | Component | Specification |
 |---|---|
 | CPU | AMD EPYC 7702P (64-core, SP3) |
-| GPU | 5x NVIDIA RTX 3090 (24GB VRAM each) |
+| GPU | 4x NVIDIA RTX 3090 (24GB VRAM each) |
 | Motherboard | ASRock Rack ROMED8-2T |
 | Cooling | Dynatron L29 AIO |
 | OS | Ubuntu 24.04 LTS |
