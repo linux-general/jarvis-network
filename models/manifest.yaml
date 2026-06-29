@@ -1,0 +1,183 @@
+# Jarvis Network model library manifest
+#
+# Declarative catalog of every model mirrored to the jarvis-models bucket on
+# Vultr Object Storage (ATL). Containers read this manifest at boot to decide
+# what to pull and verify against sha256.
+#
+# Bucket layout (single bucket, prefixed):
+#   s3://jarvis-models/llm/<id>/<files>
+#   s3://jarvis-models/stt/<id>/<files>
+#   s3://jarvis-models/tts/<id>/<files>
+#   s3://jarvis-models/diarization/<id>/<files>
+#
+# Each entry mirrors a HuggingFace repo verbatim — files, README, config, all
+# of it — so a container can hf_hub_download() against the bucket if we expose
+# it via a small HF-compatible proxy, OR boto3 cp them directly.
+#
+# Fields:
+#   id          — short slug used in container env (e.g. HF_MODEL=qwen3-32b-awq)
+#   hf_repo     — upstream HuggingFace repo (the source of truth)
+#   prefix      — S3 prefix under the bucket (llm/, stt/, tts/, diarization/)
+#   role        — one of: llm-primary, llm-coder, llm-small, stt, tts, diarization
+#   size_gb     — approximate on-disk footprint, for capacity planning
+#   runs_on     — minimum hardware to actually serve this (informational)
+#   status      — current | aspirational | archived
+#   notes       — short rationale, one line
+
+manifest_version: 1
+updated: 2026-06-29
+bucket: jarvis-models
+region: atl
+
+models:
+
+  # ── LLM: primary local-runnable on 2×3090 (48 GB VRAM) ─────────────────────
+  - id: qwen3-32b-awq
+    hf_repo: Qwen/Qwen3-32B-AWQ
+    prefix: llm/qwen3-32b-awq
+    role: llm-primary
+    size_gb: 19
+    runs_on: 2×RTX 3090 (vLLM TP=2)
+    status: current
+    notes: Current vLLM workhorse on ws-47:11436.
+
+  - id: qwen3.6-35b-a3b-awq
+    hf_repo: QuantTrio/Qwen3.6-35B-A3B-AWQ
+    prefix: llm/qwen3.6-35b-a3b-awq
+    role: llm-primary
+    size_gb: 21
+    runs_on: 2×RTX 3090 (vLLM TP=2)
+    status: current
+    notes: Newer Qwen3.6 A3B MoE; tested locally.
+
+  - id: qwen3-30b-a3b-instruct-awq
+    hf_repo: cpatonn/Qwen3-30B-A3B-Instruct-2507-AWQ-4bit
+    prefix: llm/qwen3-30b-a3b-instruct-awq
+    role: llm-primary
+    size_gb: 17
+    runs_on: 2×RTX 3090
+    status: current
+    notes: Smaller A3B variant, faster TTFT than 32B dense.
+
+  # ── LLM: coder ─────────────────────────────────────────────────────────────
+  - id: qwen2.5-coder-14b-awq
+    hf_repo: Qwen/Qwen2.5-Coder-14B-Instruct-AWQ
+    prefix: llm/qwen2.5-coder-14b-awq
+    role: llm-coder
+    size_gb: 9
+    runs_on: 1×RTX 3090
+    status: current
+    notes: Coder model, fits on a single GPU.
+
+  - id: qwen3-coder-30b-awq
+    hf_repo: Qwen/Qwen3-Coder-30B-A3B-Instruct
+    prefix: llm/qwen3-coder-30b-awq
+    role: llm-coder
+    size_gb: 18
+    runs_on: 2×RTX 3090
+    status: aspirational
+    notes: Verify HF id before first pull; replaces Qwen2.5-coder if matched.
+
+  # ── LLM: small (CPU-eligible fallback when no GPU) ─────────────────────────
+  - id: qwen2.5-0.5b-instruct
+    hf_repo: Qwen/Qwen2.5-0.5B-Instruct
+    prefix: llm/qwen2.5-0.5b-instruct
+    role: llm-small
+    size_gb: 1
+    runs_on: CPU (8+ cores, 4 GB RAM)
+    status: current
+    notes: Smoke-test model; useful for bm-42 CPU fallback before cloud.
+
+  # ── LLM: large open weights (archive — not necessarily runnable here) ──────
+  - id: llama-3.3-70b-awq
+    hf_repo: hugging-quants/Meta-Llama-3.3-70B-Instruct-AWQ-INT4
+    prefix: llm/llama-3.3-70b-awq
+    role: llm-primary
+    size_gb: 38
+    runs_on: 2×RTX 3090 (tight) or 1×A100 40 GB
+    status: aspirational
+    notes: Archive copy; tight fit on 2×3090 (38 GB weights + KV cache).
+
+  - id: mistral-small-3-24b
+    hf_repo: mistralai/Mistral-Small-3.1-24B-Instruct-2503
+    prefix: llm/mistral-small-3-24b
+    role: llm-primary
+    size_gb: 47
+    runs_on: 2×RTX 3090 (FP16) or 1×3090 (AWQ — need to find quant)
+    status: aspirational
+    notes: Find an AWQ/GPTQ quant before promoting to current.
+
+  # ── STT ────────────────────────────────────────────────────────────────────
+  - id: faster-whisper-large-v3-turbo
+    hf_repo: mobiuslabsgmbh/faster-whisper-large-v3-turbo
+    prefix: stt/faster-whisper-large-v3-turbo
+    role: stt
+    size_gb: 1.6
+    runs_on: 1×GPU (any) or CPU int8
+    status: current
+    notes: Current Wyoming STT on ws-47:10300.
+
+  - id: faster-whisper-large-v3
+    hf_repo: Systran/faster-whisper-large-v3
+    prefix: stt/faster-whisper-large-v3
+    role: stt
+    size_gb: 3.1
+    runs_on: 1×GPU or CPU int8
+    status: current
+    notes: Non-turbo backup; better accuracy on noisy audio.
+
+  - id: faster-whisper-base
+    hf_repo: Systran/faster-whisper-base
+    prefix: stt/faster-whisper-base
+    role: stt
+    size_gb: 0.15
+    runs_on: CPU
+    status: current
+    notes: Lightweight smoke-test STT.
+
+  # ── Diarization (for v5 fix) ───────────────────────────────────────────────
+  - id: pyannote-speaker-diarization-3.1
+    hf_repo: pyannote/speaker-diarization-3.1
+    prefix: diarization/pyannote-3.1
+    role: diarization
+    size_gb: 0.1
+    runs_on: 1×GPU or CPU
+    status: current
+    notes: For WhisperX + pyannote pipeline in task #14. HF gated — needs HF_TOKEN at download.
+
+  - id: pyannote-segmentation-3.0
+    hf_repo: pyannote/segmentation-3.0
+    prefix: diarization/pyannote-segmentation-3.0
+    role: diarization
+    size_gb: 0.02
+    runs_on: CPU
+    status: current
+    notes: Segmentation half of pyannote-3.1. HF gated.
+
+  # ── TTS ────────────────────────────────────────────────────────────────────
+  - id: kokoro-82m
+    hf_repo: hexgrad/Kokoro-82M
+    prefix: tts/kokoro-82m
+    role: tts
+    size_gb: 0.33
+    runs_on: CPU or 1×GPU
+    status: current
+    notes: Current Wyoming TTS on ws-47:10200. Voices bm_george, bf_emma.
+
+  - id: piper-voices
+    hf_repo: rhasspy/piper-voices
+    prefix: tts/piper-voices
+    role: tts
+    size_gb: 5.0
+    runs_on: CPU
+    status: current
+    notes: Whole repo; entry script picks en_US-amy-medium, en_GB-alan-medium, es_ES-davefx-medium at runtime.
+
+  - id: chatterbox-tts
+    hf_repo: ResembleAI/chatterbox
+    prefix: tts/chatterbox
+    role: tts
+    size_gb: 2.1
+    runs_on: 1×GPU recommended
+    status: aspirational
+    notes: For voicebox.sh-compatible voice cloning. Verify exact HF id.
