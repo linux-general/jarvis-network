@@ -1,0 +1,18 @@
+[Unit]
+Description=Jarvis Network health watcher (long-running)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/jarvis-network/scripts/watcher.py --config /etc/jarvis/watcher.json
+Restart=on-failure
+RestartSec=15s
+StandardOutput=journal
+StandardError=journal
+# When task #3 (brain container) lands and we can confidently spin a
+# replacement, add --enable-spin to ExecStart above. Until then, the
+# 'provision' action just logs.
+
+[Install]
+WantedBy=multi-user.target

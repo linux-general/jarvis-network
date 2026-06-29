@@ -1,0 +1,80 @@
+{
+  "interval_sec": 60,
+  "checks": [
+    {
+      "name": "ws-47-vllm",
+      "type": "http",
+      "url": "http://100.64.0.9:11436/v1/models",
+      "timeout_sec": 5,
+      "fail_threshold": 5,
+      "critical": true,
+      "on_fail": ["alert", "cliq"]
+    },
+    {
+      "name": "ws-47-stt",
+      "type": "tcp",
+      "host": "100.64.0.9",
+      "port": 10300,
+      "timeout_sec": 3,
+      "fail_threshold": 5,
+      "critical": true,
+      "on_fail": ["alert"]
+    },
+    {
+      "name": "ws-47-tts",
+      "type": "tcp",
+      "host": "100.64.0.9",
+      "port": 10200,
+      "timeout_sec": 3,
+      "fail_threshold": 5,
+      "critical": true,
+      "on_fail": ["alert"]
+    },
+    {
+      "name": "ws-47-v4-orchestrator",
+      "type": "http",
+      "url": "http://100.64.0.9:8445/twilio/v4/health",
+      "timeout_sec": 5,
+      "fail_threshold": 3,
+      "critical": true,
+      "on_fail": ["alert", "cliq"]
+    },
+    {
+      "name": "ws-47-v5-orchestrator",
+      "type": "http",
+      "url": "http://100.64.0.9:8446/twilio/v5/health",
+      "timeout_sec": 5,
+      "fail_threshold": 3,
+      "critical": true,
+      "on_fail": ["alert", "cliq"]
+    },
+    {
+      "name": "ws-47-steno-orchestrator",
+      "type": "http",
+      "url": "http://100.64.0.9:8447/twilio/steno/health",
+      "timeout_sec": 5,
+      "fail_threshold": 3,
+      "critical": false,
+      "on_fail": ["alert"]
+    },
+    {
+      "name": "ws-47-hermes-cliq",
+      "type": "http",
+      "url": "http://100.64.0.9:8470/healthz",
+      "timeout_sec": 5,
+      "fail_threshold": 3,
+      "critical": false,
+      "on_fail": ["alert"]
+    },
+    {
+      "name": "headscale",
+      "type": "tcp",
+      "host": "headscale.jarvisnetwork.org",
+      "port": 443,
+      "timeout_sec": 5,
+      "fail_threshold": 5,
+      "critical": true,
+      "on_fail": ["alert"]
+    }
+  ]
+}

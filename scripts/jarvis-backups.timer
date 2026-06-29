@@ -1,0 +1,12 @@
+[Unit]
+Description=Run Jarvis state snapshot every 12 hours
+Requires=jarvis-backups.service
+
+[Timer]
+OnCalendar=*-*-* 04,16:00:00
+RandomizedDelaySec=10min
+Persistent=true
+Unit=jarvis-backups.service
+
+[Install]
+WantedBy=timers.target

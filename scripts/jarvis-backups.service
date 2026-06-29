@@ -1,0 +1,11 @@
+[Unit]
+Description=Jarvis state snapshot → s3://jarvis-backups
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/jarvis-network/scripts/snapshot-state.sh
+ExecStartPost=%h/jarvis-network/scripts/infra-status.sh
+StandardOutput=journal
+StandardError=journal
