@@ -146,9 +146,18 @@ runcmd:
   - ufw allow from fd7a:115c:a1e0::/48 to any port 22 proto tcp comment 'tailnet-ssh-v6'
   - ufw --force enable
 
-  # ── 4. Clone jarvis-network ────────────────────────────────────────────────
-  - git clone --depth 1 ${JARVIS_NETWORK_REPO} /opt/jarvis-network
+  # ── 4. Clone jarvis-network (idempotent — cloud-init may re-run on reboot) ─
+  - |
+    if [ -d /opt/jarvis-network/.git ]; then
+      cd /opt/jarvis-network && git pull --rebase --quiet
+    else
+      rm -rf /opt/jarvis-network
+      git clone --depth 1 ${JARVIS_NETWORK_REPO} /opt/jarvis-network
+    fi
   - chmod +x /opt/jarvis-network/scripts/*.sh /opt/jarvis-network/scripts/*.py
+  # boto3 system-wide so the marker writer runs even if seed-models.py
+  # never created its venv (cascading-failure resilience).
+  - pip install --break-system-packages --quiet boto3 || apt-get install -y python3-boto3 || true
 
   # ── 5. Hardware-tier detector (runs at boot + every 30 min) ────────────────
   - mkdir -p /run/jarvis
