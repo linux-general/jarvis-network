@@ -222,9 +222,11 @@ if [ "$PROFILE" = "seeder" ] && [ $DESTROY_ON_DONE -eq 1 ]; then
   step "Waiting for seeder marker s3://jarvis-backups/seeder-markers/${HOSTNAME_REQ}.json"
   python3 -c 'import boto3' 2>/dev/null || PYTHON_S3="$HOME/.venvs/jarvis-os/bin/python3"
   PYTHON_S3="${PYTHON_S3:-python3}"
-  for i in $(seq 1 720); do  # up to 120 min (large repos can take a while)
-    sleep 10
-    status=$("$PYTHON_S3" - <<PY 2>/dev/null || echo "")
+  # Stage the marker-poll script in a temp file (avoids gnarly heredoc-inside-
+  # command-substitution-with-|| parsing in bash).
+  POLL_PY=$(mktemp /tmp/jarvis-seeder-poll-XXXXXX.py)
+  trap 'rm -f "$POLL_PY"' EXIT
+  cat > "$POLL_PY" <<PY
 import os, sys, json, boto3
 from botocore.exceptions import ClientError
 s3 = boto3.client("s3",
@@ -232,13 +234,18 @@ s3 = boto3.client("s3",
     aws_access_key_id=os.environ['VULTR_OS_ACCESS_KEY'],
     aws_secret_access_key=os.environ['VULTR_OS_SECRET_KEY'],
     region_name="atl")
+host = os.environ["HOSTNAME_REQ"]
 try:
-    o = s3.get_object(Bucket="jarvis-backups", Key="seeder-markers/${HOSTNAME_REQ}.json")
+    o = s3.get_object(Bucket="jarvis-backups", Key=f"seeder-markers/{host}.json")
     print(json.loads(o["Body"].read())["status"])
 except ClientError:
-    print("")
+    pass
 PY
-)
+
+  export HOSTNAME_REQ
+  for i in $(seq 1 720); do  # up to 120 min (large repos can take a while)
+    sleep 10
+    status=$("$PYTHON_S3" "$POLL_PY" 2>/dev/null)
     if [ -n "$status" ]; then
       ok "Seeder finished with status=$status"
       if [ "$status" = "success" ]; then
