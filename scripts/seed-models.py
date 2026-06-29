@@ -60,7 +60,7 @@ def _bootstrap():
     import subprocess
     subprocess.check_call(
         [str(py), "-m", "pip", "install", "--quiet",
-         "boto3", "pyyaml", "huggingface_hub[hf_transfer]", "tqdm"]
+         "boto3", "pyyaml", "huggingface_hub", "hf_transfer", "tqdm"]
     )
     os.execv(str(py), [str(py), *sys.argv])
 
@@ -138,7 +138,6 @@ def push_model(s3, model: dict, dry_run: bool):
     snapshot_download(
         repo_id=hf_repo,
         local_dir=str(staging),
-        local_dir_use_symlinks=False,
         token=token,
     )
 
