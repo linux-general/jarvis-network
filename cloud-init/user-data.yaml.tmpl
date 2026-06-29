@@ -15,6 +15,14 @@
 hostname: ${HOSTNAME}
 manage_etc_hosts: true
 
+# Authorized key for ws-47 jd, so we can SSH in over the public IP if
+# Tailscale fails to join (cloud-init crashes happen — recoverable
+# debugging requires inbound access). UFW rule allows port 22 only from
+# Tailscale CGNAT by default, so this key only matters when run with a
+# wider firewall (e.g. seeder profile temporarily opens port 22 to all).
+ssh_authorized_keys:
+  - ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBDd5DanPq4DUBjVUNVHQQXRt21LXHcptWfHJsa7vbXW jd@ws-47
+
 package_update: true
 package_upgrade: false
 packages:
@@ -50,6 +58,38 @@ write_files:
     permissions: '0600'
     content: |
       ${HEADSCALE_AUTHKEY}
+
+  - path: /opt/jarvis-network/scripts/write-seeder-marker.py
+    permissions: '0755'
+    content: |
+      #!/usr/bin/env python3
+      """Write the seeder completion marker to s3://jarvis-backups/seeder-markers/.
+      Run by the seeder branch of runcmd after seed-models.py finishes.
+      The status arg should be 'success' or 'failure'."""
+      import json, os, socket, sys
+      try:
+          import boto3
+      except ImportError:
+          # seed-models.py builds the venv at ~/.venvs/jarvis-os; re-exec into it
+          venv_py = os.path.expanduser("~/.venvs/jarvis-os/bin/python3")
+          if os.path.exists(venv_py) and sys.executable != venv_py:
+              os.execv(venv_py, [venv_py, *sys.argv])
+          raise
+      status = sys.argv[1] if len(sys.argv) > 1 else "unknown"
+      s3 = boto3.client(
+          "s3",
+          endpoint_url=f"https://{os.environ['VULTR_OS_HOSTNAME']}",
+          aws_access_key_id=os.environ["VULTR_OS_ACCESS_KEY"],
+          aws_secret_access_key=os.environ["VULTR_OS_SECRET_KEY"],
+          region_name="atl",
+      )
+      host = socket.gethostname()
+      body = json.dumps({"host": host, "status": status,
+                         "ts": int(__import__("time").time())}).encode()
+      s3.put_object(Bucket="jarvis-backups",
+                    Key=f"seeder-markers/{host}.json",
+                    Body=body, ContentType="application/json")
+      print(f"marker written: seeder-markers/{host}.json status={status}")
 
   - path: /etc/systemd/system/jarvis-hardware-tier.service
     permissions: '0644'
@@ -132,12 +172,13 @@ runcmd:
         echo "TODO: voice-bridge profile (Twilio websocket holder) — task #10"
         ;;
       seeder)
-        # One-shot: source the bucket creds (and HF_TOKEN for gated models),
-        # mirror all current-status models, signal completion by uploading
-        # a marker to s3://jarvis-backups/seeder-markers/<hostname>.json.
-        # We can't rely on SSH-into-the-seeder for the wait loop because
-        # Tailscale ACL blocks ws-47 -> seeder by default. The bucket marker
-        # is the durable signal.
+        # One-shot: source bucket creds + HF_TOKEN, mirror all current-status
+        # models, signal completion via s3://jarvis-backups/seeder-markers/.
+        # The marker is durable (no SSH/Tailscale dep) so provision.sh can
+        # detect completion even if cloud-init breaks Tailscale.
+        # Previously had inline heredoc here — bash heredoc terminator must
+        # be at column 0 which is impossible inside indented YAML runcmd,
+        # so the marker script is now write_files-staged.
         set -a; . /etc/jarvis/bootstrap.env; set +a
         export HF_HUB_ENABLE_HF_TRANSFER=1
         if /opt/jarvis-network/scripts/seed-models.py --all 2>&1 | tee /var/log/seed-models.log; then
@@ -145,25 +186,10 @@ runcmd:
         else
           status="failure"
         fi
-        # Write completion marker via the same venv seed-models.py built
-        VENV=/root/.venvs/jarvis-os
-        [ -x "$VENV/bin/python3" ] || VENV=$HOME/.venvs/jarvis-os
-        "$VENV/bin/python3" - <<PYEOF
-        import json, os, time, boto3, socket
-        s3 = boto3.client("s3",
-            endpoint_url=f"https://{os.environ['VULTR_OS_HOSTNAME']}",
-            aws_access_key_id=os.environ['VULTR_OS_ACCESS_KEY'],
-            aws_secret_access_key=os.environ['VULTR_OS_SECRET_KEY'],
-            region_name="atl")
-        body = json.dumps({
-            "host": socket.gethostname(),
-            "ts": int(time.time()),
-            "status": "$status",
-        }).encode()
-        s3.put_object(Bucket="jarvis-backups",
-                      Key=f"seeder-markers/{socket.gethostname()}.json",
-                      Body=body, ContentType="application/json")
-        PYEOF
+        # Re-exec write-seeder-marker.py — it self-bootstraps into the venv
+        # that seed-models.py created if boto3 isn't on the system Python.
+        /opt/jarvis-network/scripts/write-seeder-marker.py "$status" \
+          2>&1 | tee -a /var/log/seed-models.log
         touch /run/jarvis/seeder-done
         ;;
       *)
