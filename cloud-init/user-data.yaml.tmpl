@@ -1,0 +1,146 @@
+#cloud-config
+# Jarvis Network cloud-init template.
+# scripts/provision.sh substitutes ${VAR} placeholders before submitting to Vultr.
+#
+# Required substitutions:
+#   PROFILE              brain | edge | nginx | seeder | voice-bridge
+#   HOSTNAME             machine hostname (also the label)
+#   HEADSCALE_AUTHKEY    one-shot Tailscale pre-auth key (90s TTL preferred)
+#   JARVIS_NETWORK_REPO  e.g. https://github.com/linux-general/jarvis-network.git
+#   VULTR_OS_HOSTNAME    e.g. atl2.vultrobjects.com
+#   VULTR_OS_ACCESS_KEY  read-only scoped key for the configs bucket
+#   VULTR_OS_SECRET_KEY  read-only scoped secret for the configs bucket
+
+hostname: ${HOSTNAME}
+manage_etc_hosts: true
+
+package_update: true
+package_upgrade: false
+packages:
+  - curl
+  - jq
+  - ca-certificates
+  - gnupg
+  - lsb-release
+  - git
+  - python3
+  - python3-venv
+  - python3-pip
+  - ufw
+
+write_files:
+  - path: /etc/jarvis/profile
+    permissions: '0644'
+    content: |
+      ${PROFILE}
+
+  - path: /etc/jarvis/bootstrap.env
+    permissions: '0600'
+    content: |
+      JARVIS_PROFILE=${PROFILE}
+      JARVIS_HOSTNAME=${HOSTNAME}
+      JARVIS_NETWORK_REPO=${JARVIS_NETWORK_REPO}
+      VULTR_OS_HOSTNAME=${VULTR_OS_HOSTNAME}
+      VULTR_OS_ACCESS_KEY=${VULTR_OS_ACCESS_KEY}
+      VULTR_OS_SECRET_KEY=${VULTR_OS_SECRET_KEY}
+
+  - path: /etc/jarvis/headscale-authkey
+    permissions: '0600'
+    content: |
+      ${HEADSCALE_AUTHKEY}
+
+  - path: /etc/systemd/system/jarvis-hardware-tier.service
+    permissions: '0644'
+    content: |
+      [Unit]
+      Description=Detect GPU/CPU tier and write /run/jarvis/tier.json
+      After=network-online.target
+
+      [Service]
+      Type=oneshot
+      ExecStart=/opt/jarvis-network/scripts/detect-hardware-tier.sh
+
+  - path: /etc/systemd/system/jarvis-hardware-tier.timer
+    permissions: '0644'
+    content: |
+      [Unit]
+      Description=Re-detect hardware tier every 30 min (catches GPU hot-add)
+
+      [Timer]
+      OnBootSec=10s
+      OnUnitActiveSec=30min
+      Persistent=true
+
+      [Install]
+      WantedBy=timers.target
+
+runcmd:
+  # ── 1. Docker ──────────────────────────────────────────────────────────────
+  - |
+    install -d -m 0755 /etc/apt/keyrings
+    curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+    chmod a+r /etc/apt/keyrings/docker.gpg
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo $VERSION_CODENAME) stable" \
+      | tee /etc/apt/sources.list.d/docker.list >/dev/null
+    apt-get update -qq
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+    systemctl enable --now docker
+
+  # ── 2. Tailscale + headscale join ──────────────────────────────────────────
+  - curl -fsSL https://tailscale.com/install.sh | sh
+  - |
+    tailscale up \
+      --login-server=https://headscale.jarvisnetwork.org \
+      --authkey="$(cat /etc/jarvis/headscale-authkey)" \
+      --hostname="${HOSTNAME}" \
+      --accept-routes \
+      --ssh
+    shred -u /etc/jarvis/headscale-authkey
+
+  # ── 3. UFW: open SSH only from tailnet ─────────────────────────────────────
+  - ufw default deny incoming
+  - ufw default allow outgoing
+  - ufw allow from 100.64.0.0/10 to any port 22 proto tcp comment 'tailnet-ssh'
+  - ufw allow from fd7a:115c:a1e0::/48 to any port 22 proto tcp comment 'tailnet-ssh-v6'
+  - ufw --force enable
+
+  # ── 4. Clone jarvis-network ────────────────────────────────────────────────
+  - git clone --depth 1 ${JARVIS_NETWORK_REPO} /opt/jarvis-network
+  - chmod +x /opt/jarvis-network/scripts/*.sh /opt/jarvis-network/scripts/*.py
+
+  # ── 5. Hardware-tier detector (runs at boot + every 30 min) ────────────────
+  - mkdir -p /run/jarvis
+  - systemctl daemon-reload
+  - systemctl enable --now jarvis-hardware-tier.timer
+  - /opt/jarvis-network/scripts/detect-hardware-tier.sh
+
+  # ── 6. Profile-specific bootstrap ──────────────────────────────────────────
+  - |
+    case "${PROFILE}" in
+      brain)
+        echo "TODO: brain profile (vllm + ollama + harness compose) — task #3"
+        ;;
+      edge)
+        echo "TODO: edge profile (listener + speaker compose) — tasks #2 + #4"
+        ;;
+      nginx)
+        echo "TODO: nginx profile (reverse proxy + voice-bridge systemd unit) — task #10"
+        ;;
+      voice-bridge)
+        echo "TODO: voice-bridge profile (Twilio websocket holder) — task #10"
+        ;;
+      seeder)
+        # One-shot: install boto3 + huggingface_hub, mirror all current models, then
+        # signal completion. Provision.sh polls Vultr API and destroys the instance.
+        /opt/jarvis-network/scripts/seed-models.py --all 2>&1 | tee /var/log/seed-models.log
+        touch /run/jarvis/seeder-done
+        ;;
+      *)
+        echo "Unknown profile: ${PROFILE}" >&2
+        ;;
+    esac
+
+  # ── 7. Mark cloud-init complete ────────────────────────────────────────────
+  - touch /run/jarvis/cloud-init-done
+
+final_message: "Jarvis Network cloud-init complete. Profile=${PROFILE} Tier=$(cat /run/jarvis/tier.json 2>/dev/null | jq -r .tier)"
