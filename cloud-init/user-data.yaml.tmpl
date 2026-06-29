@@ -163,7 +163,30 @@ runcmd:
         echo "TODO: brain profile (vllm + ollama + harness compose) — task #3"
         ;;
       edge)
-        echo "TODO: edge profile (listener + speaker compose) — tasks #2 + #4"
+        # Edge profile: CPU-only node that talks to cloud STT/TTS/LLM.
+        # detect-hardware-tier.sh has already written /run/jarvis/tier.json;
+        # if recommended_mode=cloud (no GPU detected), the llm-router will
+        # boot in cloud-only mode automatically when brain.yml comes up.
+        set -a; . /etc/jarvis/bootstrap.env; set +a
+
+        # GHCR login (token must be in bootstrap.env as GHCR_PULL_TOKEN, or
+        # the compose pull will fail for private images).
+        if [ -n "${GHCR_PULL_TOKEN:-}" ]; then
+          echo "$GHCR_PULL_TOKEN" | docker login ghcr.io -u linux-general --password-stdin
+        fi
+
+        # Pull a slim "edge" compose: just llm-router + voice-orchestrator +
+        # cloud-backed STT/TTS containers. No vllm, no ollama, no caddy.
+        # The compose file is fetched from c3po-ready; consumer config (cloud
+        # API keys) comes from machine.env on first boot.
+        mkdir -p /opt/c3po-ready
+        cd /opt/c3po-ready
+        git clone --depth 1 https://github.com/linux-general/c3po-ready.git . || true
+        # TODO once c3po-ready/compose/edge-cloud.yml exists (#9 follow-up),
+        # docker compose -f compose/edge-cloud.yml up -d. For now we leave
+        # the node provisioned with images pulled and config ready, and the
+        # operator brings the stack up manually.
+        echo "edge node ready; bring up compose manually after configuring machine.env"
         ;;
       nginx)
         echo "TODO: nginx profile (reverse proxy + voice-bridge systemd unit) — task #10"
