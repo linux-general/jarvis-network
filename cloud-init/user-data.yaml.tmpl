@@ -10,6 +10,7 @@
 #   VULTR_OS_HOSTNAME    e.g. atl2.vultrobjects.com
 #   VULTR_OS_ACCESS_KEY  read-only scoped key for the configs bucket
 #   VULTR_OS_SECRET_KEY  read-only scoped secret for the configs bucket
+#   HF_TOKEN             HuggingFace read-only token (only used by seeder profile)
 
 hostname: ${HOSTNAME}
 manage_etc_hosts: true
@@ -43,6 +44,7 @@ write_files:
       VULTR_OS_HOSTNAME=${VULTR_OS_HOSTNAME}
       VULTR_OS_ACCESS_KEY=${VULTR_OS_ACCESS_KEY}
       VULTR_OS_SECRET_KEY=${VULTR_OS_SECRET_KEY}
+      HF_TOKEN=${HF_TOKEN}
 
   - path: /etc/jarvis/headscale-authkey
     permissions: '0600'
@@ -130,9 +132,38 @@ runcmd:
         echo "TODO: voice-bridge profile (Twilio websocket holder) — task #10"
         ;;
       seeder)
-        # One-shot: install boto3 + huggingface_hub, mirror all current models, then
-        # signal completion. Provision.sh polls Vultr API and destroys the instance.
-        /opt/jarvis-network/scripts/seed-models.py --all 2>&1 | tee /var/log/seed-models.log
+        # One-shot: source the bucket creds (and HF_TOKEN for gated models),
+        # mirror all current-status models, signal completion by uploading
+        # a marker to s3://jarvis-backups/seeder-markers/<hostname>.json.
+        # We can't rely on SSH-into-the-seeder for the wait loop because
+        # Tailscale ACL blocks ws-47 -> seeder by default. The bucket marker
+        # is the durable signal.
+        set -a; . /etc/jarvis/bootstrap.env; set +a
+        export HF_HUB_ENABLE_HF_TRANSFER=1
+        if /opt/jarvis-network/scripts/seed-models.py --all 2>&1 | tee /var/log/seed-models.log; then
+          status="success"
+        else
+          status="failure"
+        fi
+        # Write completion marker via the same venv seed-models.py built
+        VENV=/root/.venvs/jarvis-os
+        [ -x "$VENV/bin/python3" ] || VENV=$HOME/.venvs/jarvis-os
+        "$VENV/bin/python3" - <<PYEOF
+        import json, os, time, boto3, socket
+        s3 = boto3.client("s3",
+            endpoint_url=f"https://{os.environ['VULTR_OS_HOSTNAME']}",
+            aws_access_key_id=os.environ['VULTR_OS_ACCESS_KEY'],
+            aws_secret_access_key=os.environ['VULTR_OS_SECRET_KEY'],
+            region_name="atl")
+        body = json.dumps({
+            "host": socket.gethostname(),
+            "ts": int(time.time()),
+            "status": "$status",
+        }).encode()
+        s3.put_object(Bucket="jarvis-backups",
+                      Key=f"seeder-markers/{socket.gethostname()}.json",
+                      Body=body, ContentType="application/json")
+        PYEOF
         touch /run/jarvis/seeder-done
         ;;
       *)

@@ -143,6 +143,18 @@ fi
 # shellcheck disable=SC1091
 set -a; . "$HOME/.config/jarvis/vultr-os-credentials.env"; set +a
 
+# HF token (only required for seeder profile; optional otherwise — gated
+# models like pyannote/* need it, ungated models don't).
+HF_TOKEN=""
+if [ -f "$HOME/.config/jarvis/hf-token" ]; then
+  HF_TOKEN="$(tr -d '[:space:]' < "$HOME/.config/jarvis/hf-token")"
+fi
+if [ "$PROFILE" = "seeder" ] && [ -z "$HF_TOKEN" ]; then
+  err "Seeder profile needs HF_TOKEN. Put it in ~/.config/jarvis/hf-token (chmod 600)."
+  exit 1
+fi
+export HF_TOKEN
+
 # Idempotency: existing instance with same label?
 existing=$(curl_v "${API}/instances" | jq -r --arg h "$HOSTNAME_REQ" \
   '.instances[] | select(.label == $h) | .id' | head -1)
@@ -169,7 +181,8 @@ USER_DATA=$(
   VULTR_OS_HOSTNAME="$VULTR_OS_HOSTNAME" \
   VULTR_OS_ACCESS_KEY="$VULTR_OS_ACCESS_KEY" \
   VULTR_OS_SECRET_KEY="$VULTR_OS_SECRET_KEY" \
-    envsubst '$PROFILE $HOSTNAME $HEADSCALE_AUTHKEY $JARVIS_NETWORK_REPO $VULTR_OS_HOSTNAME $VULTR_OS_ACCESS_KEY $VULTR_OS_SECRET_KEY' < "$TEMPLATE"
+  HF_TOKEN="$HF_TOKEN" \
+    envsubst '$PROFILE $HOSTNAME $HEADSCALE_AUTHKEY $JARVIS_NETWORK_REPO $VULTR_OS_HOSTNAME $VULTR_OS_ACCESS_KEY $VULTR_OS_SECRET_KEY $HF_TOKEN' < "$TEMPLATE"
 )
 USER_DATA_B64=$(printf '%s' "$USER_DATA" | base64 -w0)
 
@@ -201,21 +214,44 @@ done
 step "Final details"
 curl_v "${API}/instances/${iid}" | jq '.instance | {id, label, plan, region, main_ip, internal_ip, status, power_status, server_status}'
 
-# Seeder one-shot lifecycle
+# Seeder one-shot lifecycle. Tailscale ACL blocks ws-47 -> seeder SSH by
+# default, so we can't poll /run/jarvis/seeder-done over SSH. Instead the
+# seeder uploads a status JSON to s3://jarvis-backups/seeder-markers/<host>.json
+# when its run completes (cloud-init step 6 in user-data.yaml.tmpl).
 if [ "$PROFILE" = "seeder" ] && [ $DESTROY_ON_DONE -eq 1 ]; then
-  step "Waiting for seeder to finish (polls /run/jarvis/seeder-done over Tailscale)"
-  for i in $(seq 1 360); do  # up to 60 min
+  step "Waiting for seeder marker s3://jarvis-backups/seeder-markers/${HOSTNAME_REQ}.json"
+  python3 -c 'import boto3' 2>/dev/null || PYTHON_S3="$HOME/.venvs/jarvis-os/bin/python3"
+  PYTHON_S3="${PYTHON_S3:-python3}"
+  for i in $(seq 1 720); do  # up to 120 min (large repos can take a while)
     sleep 10
-    if ssh -o BatchMode=yes -o ConnectTimeout=5 \
-           -o StrictHostKeyChecking=accept-new \
-           "root@${HOSTNAME_REQ}" 'test -f /run/jarvis/seeder-done' 2>/dev/null; then
-      ok "Seeder finished. Destroying instance."
-      curl_v -X DELETE "${API}/instances/${iid}"
-      ok "Destroyed $iid."
+    status=$("$PYTHON_S3" - <<PY 2>/dev/null || echo "")
+import os, sys, json, boto3
+from botocore.exceptions import ClientError
+s3 = boto3.client("s3",
+    endpoint_url=f"https://{os.environ['VULTR_OS_HOSTNAME']}",
+    aws_access_key_id=os.environ['VULTR_OS_ACCESS_KEY'],
+    aws_secret_access_key=os.environ['VULTR_OS_SECRET_KEY'],
+    region_name="atl")
+try:
+    o = s3.get_object(Bucket="jarvis-backups", Key="seeder-markers/${HOSTNAME_REQ}.json")
+    print(json.loads(o["Body"].read())["status"])
+except ClientError:
+    print("")
+PY
+)
+    if [ -n "$status" ]; then
+      ok "Seeder finished with status=$status"
+      if [ "$status" = "success" ]; then
+        step "Destroying instance $iid"
+        curl_v -X DELETE "${API}/instances/${iid}"
+        ok "Destroyed."
+      else
+        err "Seeder failed — instance LEFT RUNNING for inspection (id=$iid, ip=$(curl_v "${API}/instances/${iid}" | jq -r '.instance.main_ip'))"
+      fi
       exit 0
     fi
   done
-  err "Seeder did not finish within 60 minutes. Instance left running for inspection."
+  err "Seeder did not finish within 120 minutes. Instance left running for inspection."
   exit 1
 fi
 
