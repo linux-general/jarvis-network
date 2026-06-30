@@ -57,7 +57,11 @@ trap 'rm -f "$TMP"' EXIT
 # to the FS root.
 echo "→ Building snapshot $TS for $HOSTNAME_LABEL"
 INCLUDES=()
-add() { [ -e "$1" ] && INCLUDES+=("$1"); }
+# Use a proper if/then — `[ -e ] && cmd` returns the test status, which
+# bubbles up through this function and trips set -e when the path is
+# missing (which is fine on machines that just don't have, say, an
+# llm-wiki checkout; we want to skip, not abort).
+add() { if [ -e "$1" ]; then INCLUDES+=("$1"); fi; }
 add "$HOME/.config/jarvis"
 add "$HOME/.hermes/profiles"
 add "$HOME/.claude/projects/-home-jd/memory"
